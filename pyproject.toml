@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "latent-agents"
+version = "0.1.0"
+description = "Model-agnostic latent multi-agent communication for HuggingFace language models"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "Apache-2.0"}
+keywords = ["llm", "multi-agent", "latent-space", "transformers", "reasoning"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "torch>=2.0",
+    "transformers>=4.36",
+    "numpy",
+    "accelerate",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[project.urls]
+Homepage = "https://github.com/YOUR_USERNAME/latent-agents"
+Issues = "https://github.com/YOUR_USERNAME/latent-agents/issues"
+
+[tool.setuptools.packages.find]
+include = ["latent_agents*"]
