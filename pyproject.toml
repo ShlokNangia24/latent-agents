@@ -32,6 +32,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
+bench = ["datasets", "matplotlib", "numpy"]
 
 [project.urls]
 Homepage = "https://github.com/YOUR_USERNAME/latent-agents"
@@ -39,3 +40,8 @@ Issues = "https://github.com/YOUR_USERNAME/latent-agents/issues"
 
 [tool.setuptools.packages.find]
 include = ["latent_agents*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: end-to-end tests that download a real HuggingFace model (use --run-integration)",
+]
