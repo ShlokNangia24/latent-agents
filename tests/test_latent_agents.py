@@ -34,7 +34,12 @@ from latent_agents import (
     set_seed,
 )
 from latent_agents.model import _ensure_pad_token, past_kv_length
-from latent_agents.pipeline import _slice_tensor, truncate_kv_cache
+from latent_agents.pipeline import (
+    _extract_answer,
+    _majority_vote,
+    _slice_tensor,
+    truncate_kv_cache,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +136,7 @@ class TestAgent:
 
     def test_dataclass_fields(self):
         field_names = {f.name for f in fields(Agent)}
-        assert field_names == {"name", "role", "prompt_fn", "is_final"}
+        assert field_names == {"name", "role", "prompt_fn", "is_final", "latent_steps", "convergence_threshold"}
 
 
 # ===================================================================
@@ -429,11 +434,12 @@ class TestLatentPipelineWithMocks:
 
         model.prepare_chat_batch.side_effect = fake_prepare
 
-        # generate_latent_batch returns a fake KV-cache
-        def fake_latent(input_ids, attention_mask=None, latent_steps=20, past_key_values=None):
+        # generate_latent_batch returns (fake KV-cache, actual_steps)
+        def fake_latent(input_ids, attention_mask=None, latent_steps=20,
+                        past_key_values=None, convergence_threshold=None):
             bs = input_ids.shape[0]
             seq_len = 10 if past_key_values is None else past_kv_length(past_key_values) + 10
-            return _make_fake_kv_cache(batch_size=bs, seq_len=seq_len)
+            return _make_fake_kv_cache(batch_size=bs, seq_len=seq_len), latent_steps
 
         model.generate_latent_batch.side_effect = fake_latent
 
@@ -664,10 +670,11 @@ class TestIntegration:
     def test_generate_latent(self, model):
         messages = [[{"role": "user", "content": "Think about 2+2."}]]
         _, input_ids, attention_mask = model.prepare_chat_batch(messages)
-        kv = model.generate_latent_batch(
+        kv, actual_steps = model.generate_latent_batch(
             input_ids, attention_mask=attention_mask, latent_steps=3,
         )
         assert kv is not None
+        assert actual_steps == 3
         assert past_kv_length(kv) > input_ids.shape[1]
 
     def test_full_pipeline_two_agents(self, model):
@@ -737,3 +744,279 @@ class TestIntegration:
         )
         result = pipeline.run("test")
         assert isinstance(result.text, str)
+
+
+# ===================================================================
+# Tests: Per-Agent Latent Steps
+# ===================================================================
+
+
+class TestPerAgentLatentSteps:
+    """Tests for per-agent latent_steps and convergence_threshold overrides."""
+
+    def test_agent_latent_steps_default_none(self):
+        agent = Agent(name="A", role="a",
+                      prompt_fn=lambda q, c: [{"role": "user", "content": q}])
+        assert agent.latent_steps is None
+        assert agent.convergence_threshold is None
+
+    def test_agent_latent_steps_override(self):
+        agent = Agent(name="A", role="a",
+                      prompt_fn=lambda q, c: [{"role": "user", "content": q}],
+                      latent_steps=5, convergence_threshold=0.01)
+        assert agent.latent_steps == 5
+        assert agent.convergence_threshold == 0.01
+
+    def test_pipeline_uses_agent_override(self):
+        """When agent has latent_steps set, pipeline should use it."""
+        model = MagicMock(spec=LatentModel)
+
+        def fake_prepare(batch_messages, add_generation_prompt=True):
+            bs = len(batch_messages)
+            return [str(m) for m in batch_messages], torch.ones(bs, 5, dtype=torch.long), torch.ones(bs, 5, dtype=torch.long)
+
+        model.prepare_chat_batch.side_effect = fake_prepare
+        model.generate_latent_batch.return_value = (_make_fake_kv_cache(), 7)
+        model.generate_text_batch.return_value = (["Answer_0"], None)
+
+        agents = [
+            Agent(name="T", role="t",
+                  prompt_fn=lambda q, c: [{"role": "user", "content": q}],
+                  latent_steps=7),
+            Agent(name="S", role="s", is_final=True,
+                  prompt_fn=lambda q, c: [{"role": "user", "content": q}]),
+        ]
+        pipeline = LatentPipeline(model, agents, latent_steps=20)
+        result = pipeline.run("test")
+
+        call_kwargs = model.generate_latent_batch.call_args
+        assert call_kwargs[1]["latent_steps"] == 7  # agent override, not 20
+
+    def test_pipeline_falls_back_to_global(self):
+        """When agent has no override, pipeline global latent_steps is used."""
+        model = MagicMock(spec=LatentModel)
+
+        def fake_prepare(batch_messages, add_generation_prompt=True):
+            bs = len(batch_messages)
+            return [str(m) for m in batch_messages], torch.ones(bs, 5, dtype=torch.long), torch.ones(bs, 5, dtype=torch.long)
+
+        model.prepare_chat_batch.side_effect = fake_prepare
+        model.generate_latent_batch.return_value = (_make_fake_kv_cache(), 15)
+        model.generate_text_batch.return_value = (["Answer_0"], None)
+
+        agents = [
+            Agent(name="T", role="t",
+                  prompt_fn=lambda q, c: [{"role": "user", "content": q}]),
+            Agent(name="S", role="s", is_final=True,
+                  prompt_fn=lambda q, c: [{"role": "user", "content": q}]),
+        ]
+        pipeline = LatentPipeline(model, agents, latent_steps=15)
+        result = pipeline.run("test")
+
+        call_kwargs = model.generate_latent_batch.call_args
+        assert call_kwargs[1]["latent_steps"] == 15
+
+
+# ===================================================================
+# Tests: Convergence
+# ===================================================================
+
+
+class TestConvergence:
+    """Tests for convergence threshold passing and trace recording."""
+
+    def _make_simple_mock(self):
+        model = MagicMock(spec=LatentModel)
+
+        def fake_prepare(batch_messages, add_generation_prompt=True):
+            bs = len(batch_messages)
+            return [str(m) for m in batch_messages], torch.ones(bs, 5, dtype=torch.long), torch.ones(bs, 5, dtype=torch.long)
+
+        model.prepare_chat_batch.side_effect = fake_prepare
+        model.generate_latent_batch.return_value = (_make_fake_kv_cache(), 8)
+        model.generate_text_batch.return_value = (["Answer_0"], None)
+        return model
+
+    def test_pipeline_passes_convergence_threshold(self):
+        model = self._make_simple_mock()
+        agents = [
+            Agent(name="T", role="t",
+                  prompt_fn=lambda q, c: [{"role": "user", "content": q}]),
+            Agent(name="S", role="s", is_final=True,
+                  prompt_fn=lambda q, c: [{"role": "user", "content": q}]),
+        ]
+        pipeline = LatentPipeline(model, agents, convergence_threshold=0.05)
+        pipeline.run("test")
+
+        call_kwargs = model.generate_latent_batch.call_args
+        assert call_kwargs[1]["convergence_threshold"] == 0.05
+
+    def test_agent_threshold_overrides_pipeline(self):
+        model = self._make_simple_mock()
+        agents = [
+            Agent(name="T", role="t",
+                  prompt_fn=lambda q, c: [{"role": "user", "content": q}],
+                  convergence_threshold=0.1),
+            Agent(name="S", role="s", is_final=True,
+                  prompt_fn=lambda q, c: [{"role": "user", "content": q}]),
+        ]
+        pipeline = LatentPipeline(model, agents, convergence_threshold=0.01)
+        pipeline.run("test")
+
+        call_kwargs = model.generate_latent_batch.call_args
+        assert call_kwargs[1]["convergence_threshold"] == 0.1  # agent wins
+
+    def test_trace_records_actual_and_configured_steps(self):
+        model = self._make_simple_mock()
+        # Mock returns actual_steps=8 regardless
+        agents = [
+            Agent(name="T", role="t",
+                  prompt_fn=lambda q, c: [{"role": "user", "content": q}],
+                  latent_steps=20),
+            Agent(name="S", role="s", is_final=True,
+                  prompt_fn=lambda q, c: [{"role": "user", "content": q}]),
+        ]
+        pipeline = LatentPipeline(model, agents, latent_steps=50)
+        result = pipeline.run("test")
+
+        trace = result.agent_traces[0]
+        assert trace["latent_steps"] == 8  # actual steps from mock
+        assert trace["latent_steps_configured"] == 20  # agent override
+
+
+# ===================================================================
+# Tests: Self-Consistency Voting
+# ===================================================================
+
+
+class TestSelfConsistencyVoting:
+    """Tests for n_samples voting in the pipeline."""
+
+    def _make_voting_mock(self, answers=None):
+        model = MagicMock(spec=LatentModel)
+
+        def fake_prepare(batch_messages, add_generation_prompt=True):
+            bs = len(batch_messages)
+            return [str(m) for m in batch_messages], torch.ones(bs, 5, dtype=torch.long), torch.ones(bs, 5, dtype=torch.long)
+
+        model.prepare_chat_batch.side_effect = fake_prepare
+        model.generate_latent_batch.return_value = (_make_fake_kv_cache(), 10)
+
+        call_count = [0]
+        def fake_text(input_ids, attention_mask, max_new_tokens=256,
+                      temperature=0.7, top_p=0.95, past_key_values=None):
+            bs = input_ids.shape[0]
+            if answers:
+                texts = [answers[call_count[0] % len(answers)]] * bs
+            else:
+                texts = [f"Answer_{call_count[0]}_{i}" for i in range(bs)]
+            call_count[0] += 1
+            return texts, None
+
+        model.generate_text_batch.side_effect = fake_text
+        return model
+
+    def test_n_samples_one_unchanged(self):
+        """n_samples=1 should behave identically to before (no candidates key)."""
+        model = self._make_voting_mock()
+        agents = [
+            Agent(name="T", role="t",
+                  prompt_fn=lambda q, c: [{"role": "user", "content": q}]),
+            Agent(name="S", role="s", is_final=True,
+                  prompt_fn=lambda q, c: [{"role": "user", "content": q}]),
+        ]
+        pipeline = LatentPipeline(model, agents, n_samples=1)
+        result = pipeline.run("test")
+
+        assert "candidates" not in result.agent_traces[-1]
+        assert model.generate_text_batch.call_count == 1
+
+    def test_n_samples_multiple_calls(self):
+        """n_samples=3 should call generate_text_batch 3 times."""
+        model = self._make_voting_mock()
+        agents = [
+            Agent(name="T", role="t",
+                  prompt_fn=lambda q, c: [{"role": "user", "content": q}]),
+            Agent(name="S", role="s", is_final=True,
+                  prompt_fn=lambda q, c: [{"role": "user", "content": q}]),
+        ]
+        pipeline = LatentPipeline(model, agents, n_samples=3)
+        result = pipeline.run("test")
+
+        assert model.generate_text_batch.call_count == 3
+
+    def test_candidates_stored_in_trace(self):
+        """With n_samples=3, trace should have candidates list."""
+        model = self._make_voting_mock(answers=["#### 42", "#### 42", "#### 7"])
+        agents = [
+            Agent(name="T", role="t",
+                  prompt_fn=lambda q, c: [{"role": "user", "content": q}]),
+            Agent(name="S", role="s", is_final=True,
+                  prompt_fn=lambda q, c: [{"role": "user", "content": q}]),
+        ]
+        pipeline = LatentPipeline(model, agents, n_samples=3)
+        result = pipeline.run("test")
+
+        trace = result.agent_traces[-1]
+        assert "candidates" in trace
+        assert len(trace["candidates"]) == 3
+        assert trace["n_samples"] == 3
+
+    def test_custom_vote_fn(self):
+        """A custom vote_fn should be used instead of _majority_vote."""
+        model = self._make_voting_mock(answers=["first", "second", "third"])
+        agents = [
+            Agent(name="T", role="t",
+                  prompt_fn=lambda q, c: [{"role": "user", "content": q}]),
+            Agent(name="S", role="s", is_final=True,
+                  prompt_fn=lambda q, c: [{"role": "user", "content": q}]),
+        ]
+        # Custom vote: always pick last candidate
+        pipeline = LatentPipeline(model, agents, n_samples=3,
+                                  vote_fn=lambda candidates: candidates[-1])
+        result = pipeline.run("test")
+
+        assert result.text == "third"
+
+
+# ===================================================================
+# Tests: Majority Vote
+# ===================================================================
+
+
+class TestMajorityVote:
+    """Tests for _extract_answer and _majority_vote."""
+
+    def test_boxed_extraction(self):
+        assert _extract_answer("The answer is \\boxed{42}") == "42"
+
+    def test_hash_extraction(self):
+        assert _extract_answer("Working... #### 5") == "5"
+
+    def test_answer_is_extraction(self):
+        assert _extract_answer("Therefore the answer is 90.\nDone") == "90"
+
+    def test_final_extraction(self):
+        assert _extract_answer("FINAL ANSWER: blue") == "blue"
+
+    def test_fallback_last_line(self):
+        assert _extract_answer("line1\nline2\nline3") == "line3"
+
+    def test_majority_vote_boxed(self):
+        candidates = ["blah \\boxed{42}", "stuff \\boxed{42}", "thing \\boxed{7}"]
+        result = _majority_vote(candidates)
+        assert "42" in result
+
+    def test_majority_vote_hash(self):
+        candidates = ["#### 5", "#### 5", "#### 3"]
+        result = _majority_vote(candidates)
+        assert "5" in result
+
+    def test_majority_vote_all_different(self):
+        candidates = ["alpha", "beta", "gamma"]
+        result = _majority_vote(candidates)
+        # Returns first candidate when all different (Counter picks first seen)
+        assert result in candidates
+
+    def test_majority_vote_single(self):
+        assert _majority_vote(["only one"]) == "only one"

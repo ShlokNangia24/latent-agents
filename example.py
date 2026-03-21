@@ -63,6 +63,10 @@ def main():
     parser.add_argument("--latent_steps", type=int, default=20)
     parser.add_argument("--max_new_tokens", type=int, default=1024)
     parser.add_argument("--no_realign", action="store_true")
+    parser.add_argument("--n_samples", type=int, default=1,
+                        help="Self-consistency voting: generate N answers and majority-vote")
+    parser.add_argument("--convergence_threshold", type=float, default=None,
+                        help="Stop latent steps early when hidden-state change < threshold")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--question", type=str,
                         default="If a train travels 60 km in 40 minutes, what is its speed in km/h?")
@@ -74,10 +78,13 @@ def main():
     model = LatentModel(args.model, device=args.device, realign=not args.no_realign)
     print("Model loaded.\n")
 
+    # Per-agent latent steps: Planner thinks more, Critic/Refiner less
     agents = [
-        Agent(name="Planner", role="planner", prompt_fn=planner_prompt),
-        Agent(name="Critic",  role="critic",  prompt_fn=critic_prompt),
-        Agent(name="Refiner", role="refiner", prompt_fn=refiner_prompt),
+        Agent(name="Planner", role="planner", prompt_fn=planner_prompt,
+              latent_steps=args.latent_steps),       # uses CLI value
+        Agent(name="Critic",  role="critic",  prompt_fn=critic_prompt,
+              latent_steps=max(1, args.latent_steps // 2)),  # half as many
+        Agent(name="Refiner", role="refiner", prompt_fn=refiner_prompt),  # uses pipeline default
         Agent(name="Solver",  role="solver",  prompt_fn=solver_prompt, is_final=True),
     ]
 
@@ -85,10 +92,13 @@ def main():
         model, agents,
         latent_steps=args.latent_steps,
         max_new_tokens=args.max_new_tokens,
+        convergence_threshold=args.convergence_threshold,
+        n_samples=args.n_samples,
     )
 
     print(f"Question: {args.question}")
-    print(f"Running {len(agents)} agents with {args.latent_steps} latent steps each ...\n")
+    print(f"Running {len(agents)} agents (default latent_steps={args.latent_steps}, "
+          f"n_samples={args.n_samples}) ...\n")
 
     result = pipeline.run(args.question)
 
@@ -96,8 +106,14 @@ def main():
     print("AGENT TRACES")
     print("=" * 60)
     for trace in result.agent_traces:
-        steps = trace.get("latent_steps", "-")
-        print(f"\n--- {trace['name']} ({trace['role']}) | latent_steps={steps} ---")
+        actual = trace.get("latent_steps", "-")
+        configured = trace.get("latent_steps_configured", "")
+        steps_str = f"actual={actual}"
+        if configured:
+            steps_str += f" (configured={configured})"
+        print(f"\n--- {trace['name']} ({trace['role']}) | {steps_str} ---")
+        if trace.get("candidates"):
+            print(f"[Voted from {len(trace['candidates'])} candidates]")
         if trace["output"]:
             print(trace["output"][:500])
         else:

@@ -8,7 +8,10 @@ Orchestrates a sequence of ``Agent`` objects:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+import copy
+import re
+from collections import Counter
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -78,6 +81,50 @@ def truncate_kv_cache(
 
 
 # ---------------------------------------------------------------------------
+# Self-consistency voting helpers
+# ---------------------------------------------------------------------------
+
+def _extract_answer(text: str) -> str:
+    """Extract a canonical answer string from a generation."""
+    # Priority 1: \boxed{...}
+    m = re.search(r'\\boxed\{([^}]+)\}', text)
+    if m:
+        return m.group(1).strip()
+    # Priority 2: #### <answer>
+    m = re.search(r'####\s*(.+)', text)
+    if m:
+        return m.group(1).strip()
+    # Priority 3: "the answer is <X>"
+    m = re.search(r'the answer is\s+(.+?)[\.\n]', text, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    # Priority 4: "FINAL.*: <answer>"
+    m = re.search(r'FINAL[^:]*:\s*(.+)', text, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    # Fallback: last non-empty line
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+    return lines[-1] if lines else text.strip()
+
+
+def _majority_vote(candidates: List[str]) -> str:
+    """Select the most common answer from a list of candidates."""
+    if len(candidates) == 1:
+        return candidates[0]
+
+    extracted = [_extract_answer(c) for c in candidates]
+    counter = Counter(extracted)
+    most_common_answer = counter.most_common(1)[0][0]
+
+    # Return the full candidate text that corresponds to the winning answer
+    for c, e in zip(candidates, extracted):
+        if e == most_common_answer:
+            return c
+
+    return candidates[0]
+
+
+# ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
@@ -91,7 +138,8 @@ class LatentPipeline:
     agents : List[Agent]
         Ordered list of agents.  Exactly one must have ``is_final=True``.
     latent_steps : int
-        Number of latent recurrence steps per non-final agent.
+        Default number of latent recurrence steps per non-final agent.
+        Individual agents can override this via ``Agent.latent_steps``.
     max_new_tokens : int
         Maximum tokens for the final agent's text generation.
     temperature : float
@@ -102,6 +150,15 @@ class LatentPipeline:
         When ``True``, only the latent-step KV entries (not the prompt tokens)
         are kept between agents.  Reduces memory at the cost of discarding
         the textual prompt context from earlier agents.
+    convergence_threshold : float or None
+        Default early-stopping threshold for latent generation.  Individual
+        agents can override this via ``Agent.convergence_threshold``.
+    n_samples : int
+        Number of independent text generations for the final agent.
+        When > 1, self-consistency voting selects the best answer.
+    vote_fn : callable or None
+        Custom voting function ``(candidates: List[str]) -> str``.
+        Defaults to majority voting via answer extraction.
     """
 
     def __init__(
@@ -114,6 +171,9 @@ class LatentPipeline:
         temperature: float = 0.6,
         top_p: float = 0.95,
         keep_only_latent: bool = False,
+        convergence_threshold: Optional[float] = None,
+        n_samples: int = 1,
+        vote_fn: Optional[Callable] = None,
     ) -> None:
         final_agents = [a for a in agents if a.is_final]
         if len(final_agents) != 1:
@@ -128,6 +188,9 @@ class LatentPipeline:
         self.temperature = temperature
         self.top_p = top_p
         self.keep_only_latent = keep_only_latent
+        self.convergence_threshold = convergence_threshold
+        self.n_samples = n_samples
+        self.vote_fn = vote_fn
 
     def run(self, question: str, *, context: str = "") -> PipelineResult:
         """Run the full agent pipeline on a single question."""
@@ -146,6 +209,8 @@ class LatentPipeline:
         agent_traces: List[List[Dict[str, Any]]] = [[] for _ in range(batch_size)]
         final_texts: List[str] = [""] * batch_size
 
+        last_latent_steps = self.latent_steps  # track for final-agent gate
+
         for agent in self.agents:
             batch_messages = [agent.prompt_fn(q, context) for q in questions]
             prompts, input_ids, attention_mask = self.model.prepare_chat_batch(
@@ -153,13 +218,23 @@ class LatentPipeline:
             )
 
             if not agent.is_final:
+                # Resolve per-agent overrides
+                steps = agent.latent_steps if agent.latent_steps is not None else self.latent_steps
+                threshold = (
+                    agent.convergence_threshold
+                    if agent.convergence_threshold is not None
+                    else self.convergence_threshold
+                )
+                last_latent_steps = steps
+
                 prev_len = past_kv_length(past_kv)
 
-                past_kv = self.model.generate_latent_batch(
+                past_kv, actual_steps = self.model.generate_latent_batch(
                     input_ids,
                     attention_mask=attention_mask,
-                    latent_steps=self.latent_steps,
+                    latent_steps=steps,
                     past_key_values=past_kv,
+                    convergence_threshold=threshold,
                 )
 
                 if self.keep_only_latent:
@@ -172,31 +247,68 @@ class LatentPipeline:
                         "name": agent.name,
                         "role": agent.role,
                         "prompt": prompts[idx],
-                        "latent_steps": self.latent_steps,
+                        "latent_steps": actual_steps,
+                        "latent_steps_configured": steps,
                         "output": "",
                     })
 
             else:
-                past_for_decoding = past_kv if self.latent_steps > 0 else None
+                past_for_decoding = past_kv if last_latent_steps > 0 else None
 
-                generated_batch, _ = self.model.generate_text_batch(
-                    input_ids,
-                    attention_mask,
-                    max_new_tokens=self.max_new_tokens,
-                    temperature=self.temperature,
-                    top_p=self.top_p,
-                    past_key_values=past_for_decoding,
-                )
+                if self.n_samples <= 1:
+                    # Single generation (default behavior)
+                    generated_batch, _ = self.model.generate_text_batch(
+                        input_ids,
+                        attention_mask,
+                        max_new_tokens=self.max_new_tokens,
+                        temperature=self.temperature,
+                        top_p=self.top_p,
+                        past_key_values=past_for_decoding,
+                    )
 
-                for idx in range(batch_size):
-                    text = generated_batch[idx].strip()
-                    final_texts[idx] = text
-                    agent_traces[idx].append({
-                        "name": agent.name,
-                        "role": agent.role,
-                        "prompt": prompts[idx],
-                        "output": text,
-                    })
+                    for idx in range(batch_size):
+                        text = generated_batch[idx].strip()
+                        final_texts[idx] = text
+                        agent_traces[idx].append({
+                            "name": agent.name,
+                            "role": agent.role,
+                            "prompt": prompts[idx],
+                            "output": text,
+                        })
+                else:
+                    # Self-consistency voting: generate n_samples candidates
+                    all_candidates: List[List[str]] = [[] for _ in range(batch_size)]
+
+                    for sample_idx in range(self.n_samples):
+                        # Deep-copy KV-cache because generate() mutates it in-place
+                        kv = (
+                            copy.deepcopy(past_for_decoding)
+                            if sample_idx > 0 and past_for_decoding is not None
+                            else past_for_decoding
+                        )
+                        generated_batch, _ = self.model.generate_text_batch(
+                            input_ids,
+                            attention_mask,
+                            max_new_tokens=self.max_new_tokens,
+                            temperature=self.temperature,
+                            top_p=self.top_p,
+                            past_key_values=kv,
+                        )
+                        for idx in range(batch_size):
+                            all_candidates[idx].append(generated_batch[idx].strip())
+
+                    vote = self.vote_fn or _majority_vote
+                    for idx in range(batch_size):
+                        best = vote(all_candidates[idx])
+                        final_texts[idx] = best
+                        agent_traces[idx].append({
+                            "name": agent.name,
+                            "role": agent.role,
+                            "prompt": prompts[idx],
+                            "output": best,
+                            "candidates": all_candidates[idx],
+                            "n_samples": self.n_samples,
+                        })
 
         return [
             PipelineResult(text=final_texts[idx], agent_traces=agent_traces[idx])

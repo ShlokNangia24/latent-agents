@@ -216,8 +216,14 @@ class LatentModel:
         *,
         latent_steps: int,
         past_key_values: Optional[Tuple] = None,
-    ) -> Tuple:
-        """Run latent-space thinking -- grows the KV-cache without decoding."""
+        convergence_threshold: Optional[float] = None,
+    ) -> Tuple[Tuple, int]:
+        """Run latent-space thinking -- grows the KV-cache without decoding.
+
+        Returns ``(past_key_values, actual_steps)`` where *actual_steps* may
+        be less than *latent_steps* if early stopping via *convergence_threshold*
+        triggered.
+        """
         if input_ids.dim() != 2:
             raise ValueError("input_ids must be 2D [batch, seq_len]")
 
@@ -245,8 +251,10 @@ class LatentModel:
         )
         past = outputs.past_key_values
         last_hidden = outputs.hidden_states[-1][:, -1, :]
+        prev_hidden = last_hidden.clone()
 
-        for _ in range(latent_steps):
+        actual_steps = 0
+        for step in range(latent_steps):
             latent_vec = self.realigner.apply(last_hidden)
             latent_embed = latent_vec.unsqueeze(1)
 
@@ -266,5 +274,13 @@ class LatentModel:
             )
             past = outputs.past_key_values
             last_hidden = outputs.hidden_states[-1][:, -1, :]
+            actual_steps += 1
 
-        return past
+            if convergence_threshold is not None and step > 0:
+                delta = (last_hidden - prev_hidden).norm() / last_hidden.norm().clamp_min(1e-8)
+                if delta.item() < convergence_threshold:
+                    break
+
+            prev_hidden = last_hidden.clone()
+
+        return past, actual_steps

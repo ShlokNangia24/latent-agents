@@ -1,7 +1,7 @@
 """Agent definition for the latent multi-agent pipeline."""
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Optional
 
 
 # Type alias for prompt functions.
@@ -28,9 +28,18 @@ class Agent:
         If ``True`` this agent generates text output.  All preceding agents
         operate in latent space only.  Exactly one agent in the pipeline
         should have ``is_final=True`` (typically the last one).
+    latent_steps : int or None
+        Per-agent override for the number of latent thinking steps.
+        If ``None`` (default), the pipeline's global ``latent_steps`` is used.
+    convergence_threshold : float or None
+        If set, latent generation stops early when the relative change in
+        hidden-state norm falls below this value.  ``None`` means no early
+        stopping (or uses the pipeline-level default if one is set).
     """
 
     name: str
     role: str
     prompt_fn: PromptFn
     is_final: bool = False
+    latent_steps: Optional[int] = None
+    convergence_threshold: Optional[float] = None
