@@ -32,6 +32,7 @@ tests/
   test_latent_agents.py # Unit + integration tests
   test_benchmark.py     # Custom accuracy/speed benchmarks
   test_standard_benchmarks.py # GSM8K / MMLU / ARC benchmarks
+run_quick_benchmark.py  # Quick CPU benchmark (5 samples, M4/laptop-friendly)
 run_gpu_benchmarks.py   # Full GPU benchmark suite (Qwen3, Llama, Mistral, etc.)
 GPU_SETUP.md            # Vast.ai / A100 setup guide
 pyproject.toml          # Package metadata, deps
@@ -212,9 +213,9 @@ With 3 latent agents × 20 steps = 60 latent tokens + all prompt tokens per laye
 
 `RunStats`, `count_tokens`, `print_table`, `run_text_pipeline`, `run_latent_pipeline`, and all prompt functions (planner, critic, refiner, verifier) are copy-pasted across `test_benchmark.py`, `test_standard_benchmarks.py`, and `run_gpu_benchmarks.py`. Changes in one do NOT propagate. If you fix a bug in a prompt or runner, update all three files.
 
-### 10. `keep_only_latent` edge case
+### 10. `keep_only_latent` keeps only latent steps
 
-If `keep_only_latent=True` but `latent_steps < input_ids.shape[1]`, the code truncates the cache to `latent_steps` entries, discarding all prompt tokens. The final agent may receive very little context.
+When `keep_only_latent=True`, the KV-cache is truncated to keep only the `actual_steps` latent tokens from each agent, discarding all prompt tokens. If `actual_steps` is small (e.g., due to early convergence), the final agent may receive very little context. The final agent still receives its own prompt tokens normally.
 
 ---
 
@@ -258,9 +259,15 @@ Follow the pattern in `test_standard_benchmarks.py`:
 4. Mark with `@pytest.mark.integration`
 5. **Add to `run_gpu_benchmarks.py` as well** (and `test_benchmark.py` if relevant)
 
-### Adding Per-Agent latent_steps
+### Per-Agent Latent Steps
 
-Currently impossible — `latent_steps` is global on `LatentPipeline`. To add per-agent control, add a `latent_steps: Optional[int] = None` field to `Agent`, and in `pipeline.py` line 161, use `agent.latent_steps or self.latent_steps`.
+Supported via `Agent(latent_steps=N)`. Each agent can override the pipeline default. The pipeline resolves: `agent.latent_steps if agent.latent_steps is not None else self.latent_steps`. Same pattern applies to `convergence_threshold`.
+
+### Self-Consistency Voting
+
+Set `n_samples > 1` on `LatentPipeline` to generate multiple answers from the same KV-cache and majority-vote the best. The default `_majority_vote` extracts answers via `\boxed{}`, `####`, "the answer is", or last-line fallback. Provide a custom `vote_fn: (List[str]) -> str` if needed.
+
+**Critical:** HuggingFace `model.generate()` mutates `past_key_values` in-place. The pipeline handles this with `copy.deepcopy()` for samples after the first.
 
 ---
 
@@ -281,19 +288,25 @@ pytest tests/test_benchmark.py -v -s --run-integration
 
 # Specific benchmark
 pytest tests/test_standard_benchmarks.py -v -s --run-integration -k gsm8k
+
+# Quick benchmark on CPU/laptop (5 samples, ~3 min on M4 Pro)
+conda run -n latent-agents python run_quick_benchmark.py
 ```
 
 ### GPU Benchmark Suite
 
 ```bash
-# Sanity check (2 min)
+# Sanity check first (~2 min)
 python run_gpu_benchmarks.py --models "Qwen/Qwen3-1.7B" --n-gsm8k 5 --n-mmlu 5 --n-arc 5
 
-# Full run (3-4 hours on B200 with 179GB VRAM)
+# Full run (3-4 hours on A100/B200)
 python run_gpu_benchmarks.py
 
-# Skip gated models (no HF_TOKEN needed)
+# Skip gated models (no HF_TOKEN needed — runs Qwen3-1.7B, Qwen3-8B, Qwen3-32B)
 python run_gpu_benchmarks.py --skip-gated
+
+# Custom latent steps (default: 10)
+python run_gpu_benchmarks.py --latent-steps 20
 
 # Regenerate charts from saved results
 python run_gpu_benchmarks.py --charts-only benchmark_results.json
@@ -304,6 +317,36 @@ For gated models (Llama, Mistral, Gemma):
 export HF_TOKEN=hf_your_token_here
 huggingface-cli login --token $HF_TOKEN
 # Accept model licenses on the HuggingFace website first
+```
+
+### Recommended GPUs (vast.ai / Lambda / RunPod)
+
+| GPU | VRAM | What it runs | Rough cost | Verdict |
+|-----|------|-------------|-----------|---------|
+| **A100 80GB** | 80 GB | All models up to Qwen3-32B | ~$2-3/hr | **Best value** |
+| **H100 80GB** | 80 GB | Same as A100, ~2x faster | ~$4-5/hr | Worth it for full suite |
+| **B200 180GB** | 180 GB | Everything including Llama-70B | ~$8-10/hr | Only if you need 70B |
+| RTX 4090 | 24 GB | Qwen3-1.7B, Qwen3-8B only | ~$0.5/hr | Budget option, limited |
+| A10G | 24 GB | Same as 4090 | ~$0.6/hr | Skip it |
+
+**Recommendation:** Rent an **A100 80GB** on vast.ai. Gets you all non-gated models (1.7B, 8B, 32B) for the full 500 questions each. The full suite takes ~2 hours. Cost: ~$5 total.
+
+Setup on the rented machine:
+```bash
+git clone https://github.com/ShlokNangia24/latent-agents.git
+cd latent-agents
+pip install -e ".[dev,bench]"
+
+# Sanity check
+python run_gpu_benchmarks.py --models "Qwen/Qwen3-1.7B" --n-gsm8k 5 --n-mmlu 5 --n-arc 5
+
+# Full non-gated run in background
+nohup python run_gpu_benchmarks.py --skip-gated > run.log 2>&1 &
+tail -f run.log
+
+# Copy results back to Mac when done
+scp -P <PORT> root@<HOST>:~/latent-agents/benchmark_results.json .
+scp -rP <PORT> root@<HOST>:~/latent-agents/charts/ ./charts/
 ```
 
 ---
@@ -318,6 +361,14 @@ These paths have no test coverage. Be careful when modifying them:
 4. **Multi-agent KV-cache correctness** — mocks verify methods are called but don't verify the cache actually improves output
 5. **`realign=False` through full pipeline** — only tested in isolation
 6. **Batch size > 1 KV-cache shape compatibility** — integration test checks output is non-empty, not that shapes are correct
+
+### Recently Fixed Bugs (for context)
+
+- **`past_kv_length` now supports `DynamicCache`** — uses `get_seq_length()` when available, falls back to legacy tuple `[0][0].shape[-2]`. Tested with real `DynamicCache` objects.
+- **Left-padding enabled** — `tokenizer.padding_side = "left"` set in `LatentModel.__init__`. Fixes batch > 1 inference where hidden states were extracted from pad tokens.
+- **`keep_only_latent` now keeps only latent steps** — previously kept `prompt_len + actual_steps` tokens; now keeps only `actual_steps` as documented.
+- **`check_answer` in `run_quick_benchmark.py`** — removed bidirectional substring match (`gen in exp`) that caused false positives (e.g., `"4"` matching `"40"`).
+- **`--latent-steps` CLI arg in `run_gpu_benchmarks.py`** — was parsed but never passed to `benchmark_one_model`, so the pipeline always used `latent_steps=10` regardless of the flag. Now correctly wired through.
 
 ---
 

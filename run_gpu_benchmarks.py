@@ -461,6 +461,7 @@ def benchmark_one_model(
     gsm8k_data: list,
     mmlu_data: list,
     arc_data: list,
+    latent_steps: int = 10,
 ) -> Dict[str, Any]:
     """Run all benchmarks for one model. Returns results dict."""
 
@@ -534,7 +535,7 @@ def benchmark_one_model(
 
             if cfg["type"] == "latent":
                 pipeline = LatentPipeline(
-                    model, cfg["agents"], latent_steps=10,
+                    model, cfg["agents"], latent_steps=latent_steps,
                     max_new_tokens=max_tok, temperature=0.6,
                 )
 
@@ -652,8 +653,14 @@ def _save(fig, path: str):
 
 
 def generate_charts(all_results: Dict[str, Any], out_dir: str = "charts"):
-    """Generate all charts from a completed results dict."""
-    _ensure_dir(out_dir)
+    """Generate all charts from a completed results dict.
+
+    Output structure:
+      {out_dir}/overall/        -- cross-model comparison charts
+      {out_dir}/{ModelName}/    -- per-model drill-down charts
+    """
+    overall_dir = f"{out_dir}/overall"
+    _ensure_dir(overall_dir)
 
     successful = [m for m in all_results["models"] if "error" not in m]
     if not successful:
@@ -662,6 +669,10 @@ def generate_charts(all_results: Dict[str, Any], out_dir: str = "charts"):
 
     model_names = [m["display_name"] for m in successful]
     bench_keys = list(BENCH_LABELS.keys())
+
+    # ==================================================================
+    # OVERALL: cross-model comparison charts
+    # ==================================================================
 
     # ------------------------------------------------------------------
     # 1. Accuracy grouped bar chart – one chart per benchmark
@@ -672,12 +683,9 @@ def generate_charts(all_results: Dict[str, Any], out_dir: str = "charts"):
         width = 0.25
 
         for i, pipe in enumerate(PIPELINES):
-            accs = []
-            for m in successful:
-                accs.append(m["benchmarks"][bk][pipe]["accuracy_pct"])
+            accs = [m["benchmarks"][bk][pipe]["accuracy_pct"] for m in successful]
             bars = ax.bar(x + i * width, accs, width, label=pipe,
                           color=PIPE_COLORS[pipe], edgecolor="white", linewidth=0.5)
-            # labels on bars
             for bar, v in zip(bars, accs):
                 ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
                         f"{v:.0f}", ha="center", va="bottom", fontsize=7)
@@ -689,7 +697,7 @@ def generate_charts(all_results: Dict[str, Any], out_dir: str = "charts"):
         ax.set_ylim(0, min(100, ax.get_ylim()[1] * 1.15))
         ax.legend(fontsize=8, loc="upper left")
         ax.grid(axis="y", alpha=0.3)
-        _save(fig, f"{out_dir}/accuracy_{bk}.png")
+        _save(fig, f"{overall_dir}/accuracy_{bk}.png")
 
     # ------------------------------------------------------------------
     # 2. Overall accuracy across all benchmarks
@@ -717,7 +725,7 @@ def generate_charts(all_results: Dict[str, Any], out_dir: str = "charts"):
     ax.set_ylim(0, min(100, ax.get_ylim()[1] * 1.15))
     ax.legend(fontsize=8, loc="upper left")
     ax.grid(axis="y", alpha=0.3)
-    _save(fig, f"{out_dir}/accuracy_overall.png")
+    _save(fig, f"{overall_dir}/accuracy_overall.png")
 
     # ------------------------------------------------------------------
     # 3. Token generation comparison (bar chart)
@@ -744,7 +752,7 @@ def generate_charts(all_results: Dict[str, Any], out_dir: str = "charts"):
     ax.legend(fontsize=8, loc="upper left")
     ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v/1000:.0f}k" if v >= 1000 else f"{v:.0f}"))
     ax.grid(axis="y", alpha=0.3)
-    _save(fig, f"{out_dir}/tokens_generated.png")
+    _save(fig, f"{overall_dir}/tokens_generated.png")
 
     # ------------------------------------------------------------------
     # 4. Token savings % (Latent vs Non-Latent) – horizontal bar
@@ -769,7 +777,7 @@ def generate_charts(all_results: Dict[str, Any], out_dir: str = "charts"):
     ax.set_title("Token Savings: Latent vs Non-Latent 4-Agent", fontweight="bold")
     ax.axvline(x=0, color="grey", linewidth=0.8)
     ax.grid(axis="x", alpha=0.3)
-    _save(fig, f"{out_dir}/token_savings.png")
+    _save(fig, f"{overall_dir}/token_savings.png")
 
     # ------------------------------------------------------------------
     # 5. Speedup (wall-time) – horizontal bar
@@ -793,7 +801,7 @@ def generate_charts(all_results: Dict[str, Any], out_dir: str = "charts"):
     ax.axvline(x=1.0, color="red", linewidth=0.8, linestyle="--", label="Break-even (1x)")
     ax.legend(fontsize=8)
     ax.grid(axis="x", alpha=0.3)
-    _save(fig, f"{out_dir}/speedup.png")
+    _save(fig, f"{overall_dir}/speedup.png")
 
     # ------------------------------------------------------------------
     # 6. Wall-time comparison (grouped bar)
@@ -816,17 +824,15 @@ def generate_charts(all_results: Dict[str, Any], out_dir: str = "charts"):
     ax.set_xticklabels(model_names, rotation=30, ha="right", fontsize=8)
     ax.legend(fontsize=8, loc="upper left")
     ax.grid(axis="y", alpha=0.3)
-    _save(fig, f"{out_dir}/wall_time.png")
+    _save(fig, f"{overall_dir}/wall_time.png")
 
     # ------------------------------------------------------------------
     # 7. Accuracy vs Model Size scatter (one line per pipeline)
     # ------------------------------------------------------------------
-    # Try to estimate param count from display name for x-axis ordering
     param_estimates = {
         "Qwen3-1.7B": 1.7, "Llama-3.1-8B": 8, "Qwen3-8B": 8,
         "Mistral-7B": 7, "Gemma-2-9b": 9, "Qwen3-32B": 32, "Llama-3.1-70B": 70,
     }
-    # Collect (param_count, model_name, {pipeline: accuracy})
     scatter_data = []
     for m in successful:
         p = param_estimates.get(m["display_name"], 0)
@@ -855,16 +861,16 @@ def generate_charts(all_results: Dict[str, Any], out_dir: str = "charts"):
         ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.0f}B"))
         ax.legend(fontsize=8)
         ax.grid(alpha=0.3)
-        _save(fig, f"{out_dir}/accuracy_vs_size.png")
+        _save(fig, f"{overall_dir}/accuracy_vs_size.png")
 
     # ------------------------------------------------------------------
-    # 8. Radar / spider chart per benchmark  (accuracy comparison)
+    # 8. Radar / spider chart per pipeline (accuracy comparison across models)
     # ------------------------------------------------------------------
     if len(successful) >= 3:
         bench_list = list(BENCH_LABELS.values())
         num_vars = len(bench_list)
         angles = np.linspace(0, 2 * np.pi, num_vars, endpoint=False).tolist()
-        angles += angles[:1]  # close the polygon
+        angles += angles[:1]
 
         for pipe in PIPELINES:
             fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
@@ -880,41 +886,327 @@ def generate_charts(all_results: Dict[str, Any], out_dir: str = "charts"):
             ax.set_title(f"{pipe}: Accuracy Radar", fontweight="bold", pad=20)
             ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.1), fontsize=7)
             pipe_slug = pipe.lower().replace(" ", "_").replace("-", "")
-            _save(fig, f"{out_dir}/radar_{pipe_slug}.png")
+            _save(fig, f"{overall_dir}/radar_{pipe_slug}.png")
 
     # ------------------------------------------------------------------
     # 9. Accuracy delta heatmap (Latent minus Non-Latent)
     # ------------------------------------------------------------------
-    if len(successful) >= 1:
-        delta_matrix = []
-        for m in successful:
-            row = []
-            for bk in bench_keys:
-                la = m["benchmarks"][bk]["Latent 4-Agent"]["accuracy_pct"]
-                nl = m["benchmarks"][bk]["Non-Latent 4-Agent"]["accuracy_pct"]
-                row.append(la - nl)
-            delta_matrix.append(row)
+    delta_matrix = []
+    for m in successful:
+        row = [
+            m["benchmarks"][bk]["Latent 4-Agent"]["accuracy_pct"]
+            - m["benchmarks"][bk]["Non-Latent 4-Agent"]["accuracy_pct"]
+            for bk in bench_keys
+        ]
+        delta_matrix.append(row)
 
-        delta_arr = np.array(delta_matrix)
-        fig, ax = plt.subplots(figsize=(max(5, len(bench_keys) * 1.5),
-                                        max(3, len(model_names) * 0.6)))
-        vabs = max(abs(delta_arr.min()), abs(delta_arr.max()), 5)
-        im = ax.imshow(delta_arr, cmap="RdYlGn", aspect="auto",
-                       vmin=-vabs, vmax=vabs)
-        ax.set_xticks(range(len(bench_keys)))
-        ax.set_xticklabels([BENCH_LABELS[bk] for bk in bench_keys], fontsize=9)
-        ax.set_yticks(range(len(model_names)))
-        ax.set_yticklabels(model_names, fontsize=9)
-        for i in range(len(model_names)):
-            for j in range(len(bench_keys)):
-                ax.text(j, i, f"{delta_arr[i, j]:+.1f}",
-                        ha="center", va="center", fontsize=9,
-                        color="white" if abs(delta_arr[i, j]) > vabs * 0.6 else "black")
-        ax.set_title("Accuracy Delta: Latent - Non-Latent 4-Agent (pp)", fontweight="bold")
-        fig.colorbar(im, ax=ax, label="Accuracy Difference (pp)")
-        _save(fig, f"{out_dir}/accuracy_delta_heatmap.png")
+    delta_arr = np.array(delta_matrix)
+    fig, ax = plt.subplots(figsize=(max(5, len(bench_keys) * 1.5),
+                                    max(3, len(model_names) * 0.6)))
+    vabs = max(abs(delta_arr.min()), abs(delta_arr.max()), 5)
+    im = ax.imshow(delta_arr, cmap="RdYlGn", aspect="auto", vmin=-vabs, vmax=vabs)
+    ax.set_xticks(range(len(bench_keys)))
+    ax.set_xticklabels([BENCH_LABELS[bk] for bk in bench_keys], fontsize=9)
+    ax.set_yticks(range(len(model_names)))
+    ax.set_yticklabels(model_names, fontsize=9)
+    for i in range(len(model_names)):
+        for j in range(len(bench_keys)):
+            ax.text(j, i, f"{delta_arr[i, j]:+.1f}",
+                    ha="center", va="center", fontsize=9,
+                    color="white" if abs(delta_arr[i, j]) > vabs * 0.6 else "black")
+    ax.set_title("Accuracy Delta: Latent - Non-Latent 4-Agent (pp)", fontweight="bold")
+    fig.colorbar(im, ax=ax, label="Accuracy Difference (pp)")
+    _save(fig, f"{overall_dir}/accuracy_delta_heatmap.png")
 
-    print(f"\n  All charts saved to {out_dir}/\n")
+    # ------------------------------------------------------------------
+    # 10. (Paper Figure 4 style) Per-benchmark speedup — grouped bar
+    #     One group per benchmark, one bar per model
+    # ------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(max(6, 2.0 * len(bench_keys)), 5))
+    x = np.arange(len(bench_keys))
+    bw = 0.8 / max(len(successful), 1)
+    cmap = plt.cm.get_cmap("tab10", len(successful))
+
+    for j, m in enumerate(successful):
+        sps = []
+        for bk in bench_keys:
+            nl_t = m["benchmarks"][bk]["Non-Latent 4-Agent"]["wall_time_s"]
+            la_t = m["benchmarks"][bk]["Latent 4-Agent"]["wall_time_s"]
+            sps.append(nl_t / la_t if la_t > 0 else 0)
+        offset = (j - len(successful) / 2 + 0.5) * bw
+        bars = ax.bar(x + offset, sps, bw, label=m["display_name"],
+                      color=cmap(j), edgecolor="white", linewidth=0.5)
+        for bar, v in zip(bars, sps):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.05,
+                    f"{v:.1f}x", ha="center", va="bottom", fontsize=7)
+
+    ax.axhline(y=1.0, color="red", linewidth=0.8, linestyle="--", label="No speedup (1x)")
+    ax.set_ylabel("Speedup (Non-Latent / Latent wall time)")
+    ax.set_title("Per-Benchmark Speedup: Latent vs Non-Latent 4-Agent", fontweight="bold")
+    ax.set_xticks(x)
+    ax.set_xticklabels([BENCH_LABELS[bk] for bk in bench_keys], fontsize=10)
+    ax.legend(fontsize=7, loc="upper right")
+    ax.grid(axis="y", alpha=0.3)
+    _save(fig, f"{overall_dir}/per_benchmark_speedup.png")
+
+    # ------------------------------------------------------------------
+    # 11. (Paper Figure 4 style) Per-benchmark token usage with % reduction
+    #     Grouped bars: Non-Latent vs Latent tokens per benchmark per model
+    # ------------------------------------------------------------------
+    fig, axes = plt.subplots(1, len(bench_keys),
+                             figsize=(5 * len(bench_keys), 5), sharey=False)
+    if len(bench_keys) == 1:
+        axes = [axes]
+
+    for ax, bk in zip(axes, bench_keys):
+        nl_toks = [m["benchmarks"][bk]["Non-Latent 4-Agent"]["generated_tokens"] for m in successful]
+        la_toks = [m["benchmarks"][bk]["Latent 4-Agent"]["generated_tokens"] for m in successful]
+        x = np.arange(len(successful))
+        w = 0.35
+        ax.bar(x - w / 2, nl_toks, w, label="Non-Latent", color=PIPE_COLORS["Non-Latent 4-Agent"],
+               edgecolor="white", linewidth=0.5)
+        bars_la = ax.bar(x + w / 2, la_toks, w, label="Latent", color=PIPE_COLORS["Latent 4-Agent"],
+                         edgecolor="white", linewidth=0.5)
+
+        # Annotate % reduction above each latent bar
+        for bar, nl, la in zip(bars_la, nl_toks, la_toks):
+            if nl > 0:
+                pct = (1 - la / nl) * 100
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max(nl_toks) * 0.02,
+                        f"-{pct:.0f}%", ha="center", va="bottom", fontsize=8,
+                        color="#55A868", fontweight="bold")
+
+        ax.set_title(BENCH_LABELS[bk], fontweight="bold")
+        ax.set_ylabel("Generated Tokens")
+        ax.set_xticks(x)
+        ax.set_xticklabels(model_names, rotation=30, ha="right", fontsize=7)
+        ax.yaxis.set_major_formatter(mticker.FuncFormatter(
+            lambda v, _: f"{v/1000:.0f}k" if v >= 1000 else f"{v:.0f}"))
+        ax.legend(fontsize=7)
+        ax.grid(axis="y", alpha=0.3)
+
+    fig.suptitle("Per-Benchmark Token Usage: Non-Latent vs Latent 4-Agent", fontweight="bold")
+    fig.tight_layout()
+    _save(fig, f"{overall_dir}/per_benchmark_token_usage.png")
+
+    # ------------------------------------------------------------------
+    # 12. Summary metrics table PNG (paper Table 3 style)
+    #     Rows: benchmark × model; Cols: pipeline accuracy / tokens / speedup
+    # ------------------------------------------------------------------
+    col_headers = ["Model", "Benchmark",
+                   "Single\nAcc%", "Non-Lat\nAcc%", "Latent\nAcc%",
+                   "Non-Lat\nTokens", "Latent\nTokens", "Token\nSaving",
+                   "Speedup"]
+    rows = []
+    for m in successful:
+        for bk in bench_keys:
+            sa = m["benchmarks"][bk]["Single Agent"]["accuracy_pct"]
+            nla = m["benchmarks"][bk]["Non-Latent 4-Agent"]["accuracy_pct"]
+            la = m["benchmarks"][bk]["Latent 4-Agent"]["accuracy_pct"]
+            nl_tok = m["benchmarks"][bk]["Non-Latent 4-Agent"]["generated_tokens"]
+            la_tok = m["benchmarks"][bk]["Latent 4-Agent"]["generated_tokens"]
+            saving = f"{(1 - la_tok / nl_tok) * 100:.0f}%" if nl_tok > 0 else "—"
+            nl_t = m["benchmarks"][bk]["Non-Latent 4-Agent"]["wall_time_s"]
+            la_t = m["benchmarks"][bk]["Latent 4-Agent"]["wall_time_s"]
+            spd = f"{nl_t / la_t:.1f}x" if la_t > 0 else "—"
+            rows.append([
+                m["display_name"], BENCH_LABELS[bk],
+                f"{sa:.0f}%", f"{nla:.0f}%", f"{la:.0f}%",
+                f"{nl_tok:,}", f"{la_tok:,}", saving, spd,
+            ])
+
+    fig_h = max(2.5, 0.35 * len(rows) + 1.2)
+    fig, ax = plt.subplots(figsize=(14, fig_h))
+    ax.axis("off")
+    tbl = ax.table(
+        cellText=rows,
+        colLabels=col_headers,
+        cellLoc="center",
+        loc="center",
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(8)
+    tbl.auto_set_column_width(col=list(range(len(col_headers))))
+
+    # Style header row
+    for j in range(len(col_headers)):
+        cell = tbl[0, j]
+        cell.set_facecolor("#2C4770")
+        cell.set_text_props(color="white", fontweight="bold")
+
+    # Alternate row shading and highlight latent accuracy if higher than non-latent
+    for i, row in enumerate(rows):
+        bg = "#F5F5F5" if i % 2 == 0 else "white"
+        for j in range(len(col_headers)):
+            tbl[i + 1, j].set_facecolor(bg)
+        # Highlight latent acc cell green if >= non-latent
+        try:
+            nla_v = float(row[3].rstrip("%"))
+            la_v = float(row[4].rstrip("%"))
+            if la_v >= nla_v:
+                tbl[i + 1, 4].set_facecolor("#D4EDDA")
+        except ValueError:
+            pass
+
+    ax.set_title("LatentMAS Summary: Accuracy / Tokens / Speedup", fontweight="bold",
+                 fontsize=11, pad=12)
+    _save(fig, f"{overall_dir}/summary_table.png")
+
+    # ==================================================================
+    # PER-MODEL: individual drill-down charts
+    # ==================================================================
+    for m in successful:
+        slug = m["display_name"].replace(" ", "_").replace("/", "_")
+        model_dir = f"{out_dir}/{slug}"
+        _ensure_dir(model_dir)
+
+        # ------------------------------------------------------------------
+        # A. Accuracy by benchmark (grouped bar — 3 pipelines)
+        # ------------------------------------------------------------------
+        bench_labels_list = [BENCH_LABELS[bk] for bk in bench_keys]
+        fig, ax = plt.subplots(figsize=(max(5, 1.8 * len(bench_keys)), 5))
+        x = np.arange(len(bench_keys))
+        width = 0.25
+
+        for i, pipe in enumerate(PIPELINES):
+            accs = [m["benchmarks"][bk][pipe]["accuracy_pct"] for bk in bench_keys]
+            bars = ax.bar(x + i * width, accs, width, label=pipe,
+                          color=PIPE_COLORS[pipe], edgecolor="white", linewidth=0.5)
+            for bar, v in zip(bars, accs):
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                        f"{v:.0f}%", ha="center", va="bottom", fontsize=8)
+
+        ax.set_ylabel("Accuracy (%)")
+        ax.set_title(f"{m['display_name']}: Accuracy by Benchmark", fontweight="bold")
+        ax.set_xticks(x + width)
+        ax.set_xticklabels(bench_labels_list, fontsize=10)
+        ax.set_ylim(0, min(100, ax.get_ylim()[1] * 1.15))
+        ax.legend(fontsize=8)
+        ax.grid(axis="y", alpha=0.3)
+        _save(fig, f"{model_dir}/accuracy_by_benchmark.png")
+
+        # ------------------------------------------------------------------
+        # B. Per-benchmark speedup (latent vs non-latent) — bar chart
+        # ------------------------------------------------------------------
+        fig, ax = plt.subplots(figsize=(max(5, 1.8 * len(bench_keys)), 4))
+        sps = []
+        for bk in bench_keys:
+            nl_t = m["benchmarks"][bk]["Non-Latent 4-Agent"]["wall_time_s"]
+            la_t = m["benchmarks"][bk]["Latent 4-Agent"]["wall_time_s"]
+            sps.append(nl_t / la_t if la_t > 0 else 0)
+
+        bar_colors = ["#55A868" if s >= 1.0 else "#C44E52" for s in sps]
+        bars = ax.bar(bench_labels_list, sps, color=bar_colors, edgecolor="white", linewidth=0.5)
+        for bar, v in zip(bars, sps):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.03,
+                    f"{v:.2f}x", ha="center", va="bottom", fontsize=9, fontweight="bold")
+
+        ax.axhline(y=1.0, color="red", linewidth=1.0, linestyle="--", label="Break-even (1x)")
+        ax.set_ylabel("Speedup")
+        ax.set_title(f"{m['display_name']}: Per-Benchmark Speedup (Latent vs Non-Latent)",
+                     fontweight="bold")
+        ax.legend(fontsize=8)
+        ax.grid(axis="y", alpha=0.3)
+        _save(fig, f"{model_dir}/per_benchmark_speedup.png")
+
+        # ------------------------------------------------------------------
+        # C. Per-benchmark token usage with % reduction annotations
+        # ------------------------------------------------------------------
+        fig, ax = plt.subplots(figsize=(max(5, 1.8 * len(bench_keys)), 5))
+        x = np.arange(len(bench_keys))
+        w = 0.35
+
+        nl_toks = [m["benchmarks"][bk]["Non-Latent 4-Agent"]["generated_tokens"] for bk in bench_keys]
+        la_toks = [m["benchmarks"][bk]["Latent 4-Agent"]["generated_tokens"] for bk in bench_keys]
+        sa_toks = [m["benchmarks"][bk]["Single Agent"]["generated_tokens"] for bk in bench_keys]
+
+        ax.bar(x - w, sa_toks, w, label="Single Agent",
+               color=PIPE_COLORS["Single Agent"], edgecolor="white", linewidth=0.5)
+        ax.bar(x, nl_toks, w, label="Non-Latent 4-Agent",
+               color=PIPE_COLORS["Non-Latent 4-Agent"], edgecolor="white", linewidth=0.5)
+        bars_la = ax.bar(x + w, la_toks, w, label="Latent 4-Agent",
+                         color=PIPE_COLORS["Latent 4-Agent"], edgecolor="white", linewidth=0.5)
+
+        max_tok = max(max(nl_toks), max(la_toks), max(sa_toks))
+        for bar, nl, la in zip(bars_la, nl_toks, la_toks):
+            if nl > 0:
+                pct = (1 - la / nl) * 100
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max_tok * 0.02,
+                        f"-{pct:.0f}%", ha="center", va="bottom", fontsize=8,
+                        color="#55A868", fontweight="bold")
+
+        ax.set_ylabel("Generated Tokens")
+        ax.set_title(f"{m['display_name']}: Token Usage per Benchmark", fontweight="bold")
+        ax.set_xticks(x)
+        ax.set_xticklabels(bench_labels_list, fontsize=10)
+        ax.yaxis.set_major_formatter(mticker.FuncFormatter(
+            lambda v, _: f"{v/1000:.0f}k" if v >= 1000 else f"{v:.0f}"))
+        ax.legend(fontsize=8)
+        ax.grid(axis="y", alpha=0.3)
+        _save(fig, f"{model_dir}/token_usage.png")
+
+        # ------------------------------------------------------------------
+        # D. Summary metrics table as PNG
+        # ------------------------------------------------------------------
+        tbl_rows = []
+        for bk in bench_keys:
+            sa_acc = m["benchmarks"][bk]["Single Agent"]["accuracy_pct"]
+            nla_acc = m["benchmarks"][bk]["Non-Latent 4-Agent"]["accuracy_pct"]
+            la_acc = m["benchmarks"][bk]["Latent 4-Agent"]["accuracy_pct"]
+            nl_tok = m["benchmarks"][bk]["Non-Latent 4-Agent"]["generated_tokens"]
+            la_tok = m["benchmarks"][bk]["Latent 4-Agent"]["generated_tokens"]
+            saving = f"{(1 - la_tok / nl_tok) * 100:.0f}%" if nl_tok > 0 else "—"
+            nl_t = m["benchmarks"][bk]["Non-Latent 4-Agent"]["wall_time_s"]
+            la_t = m["benchmarks"][bk]["Latent 4-Agent"]["wall_time_s"]
+            spd = f"{nl_t / la_t:.1f}x" if la_t > 0 else "—"
+            tbl_rows.append([
+                BENCH_LABELS[bk],
+                f"{sa_acc:.0f}%", f"{nla_acc:.0f}%", f"{la_acc:.0f}%",
+                f"{nl_tok:,}", f"{la_tok:,}", saving, spd,
+            ])
+
+        tbl_headers = ["Benchmark", "Single\nAcc%", "Non-Lat\nAcc%", "Latent\nAcc%",
+                       "Non-Lat\nTokens", "Latent\nTokens", "Token\nSaving", "Speedup"]
+
+        fig, ax = plt.subplots(figsize=(11, max(2.5, 0.5 * len(tbl_rows) + 1.5)))
+        ax.axis("off")
+        tbl = ax.table(
+            cellText=tbl_rows,
+            colLabels=tbl_headers,
+            cellLoc="center",
+            loc="center",
+        )
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(9)
+        tbl.auto_set_column_width(col=list(range(len(tbl_headers))))
+
+        for j in range(len(tbl_headers)):
+            cell = tbl[0, j]
+            cell.set_facecolor("#2C4770")
+            cell.set_text_props(color="white", fontweight="bold")
+
+        for i, row in enumerate(tbl_rows):
+            bg = "#F5F5F5" if i % 2 == 0 else "white"
+            for j in range(len(tbl_headers)):
+                tbl[i + 1, j].set_facecolor(bg)
+            try:
+                nla_v = float(row[2].rstrip("%"))
+                la_v = float(row[3].rstrip("%"))
+                if la_v >= nla_v:
+                    tbl[i + 1, 3].set_facecolor("#D4EDDA")
+            except ValueError:
+                pass
+
+        ax.set_title(f"{m['display_name']}: Results Summary", fontweight="bold",
+                     fontsize=11, pad=12)
+        _save(fig, f"{model_dir}/summary_table.png")
+
+    print(f"\n  Charts saved:")
+    print(f"    Overall comparisons  -> {overall_dir}/")
+    for m in successful:
+        slug = m["display_name"].replace(" ", "_").replace("/", "_")
+        print(f"    {m['display_name']:25s} -> {out_dir}/{slug}/")
+    print()
 
 
 # ===========================================================================
@@ -1000,7 +1292,8 @@ def main():
             continue
 
         try:
-            result = benchmark_one_model(model_id, display, gsm8k, mmlu, arc)
+            result = benchmark_one_model(model_id, display, gsm8k, mmlu, arc,
+                                         latent_steps=args.latent_steps)
             all_results["models"].append(result)
         except Exception as e:
             print(f"\n  ERROR on {display}: {e}")

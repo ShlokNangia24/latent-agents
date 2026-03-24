@@ -34,10 +34,14 @@ def _ensure_pad_token(tokenizer: AutoTokenizer) -> None:
             tokenizer.add_special_tokens({"pad_token": "<pad>"})
 
 
-def past_kv_length(past_key_values: Optional[Tuple]) -> int:
-    """Return the sequence length stored in a KV-cache tuple."""
+def past_kv_length(past_key_values) -> int:
+    """Return the sequence length stored in a KV-cache (tuple or Cache object)."""
     if not past_key_values:
         return 0
+    # Modern transformers Cache objects (DynamicCache, etc.)
+    if hasattr(past_key_values, 'get_seq_length'):
+        return past_key_values.get_seq_length()
+    # Legacy tuple format: ((key, value), ...) per layer
     k = past_key_values[0][0]
     return k.shape[-2]
 
@@ -81,6 +85,7 @@ class LatentModel:
             model_name_or_path, use_fast=True,
         )
         _ensure_pad_token(self.tokenizer)
+        self.tokenizer.padding_side = "left"
 
         with torch.no_grad():
             self.model = AutoModelForCausalLM.from_pretrained(

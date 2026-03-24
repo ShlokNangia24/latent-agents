@@ -217,6 +217,27 @@ class TestModelHelpers:
         cache = _make_fake_kv_cache(seq_len=42)
         assert past_kv_length(cache) == 42
 
+    def test_past_kv_length_with_dynamic_cache(self):
+        """past_kv_length should work with transformers DynamicCache objects."""
+        try:
+            from transformers.cache_utils import DynamicCache
+        except ImportError:
+            pytest.skip("DynamicCache not available in this transformers version")
+        dc = DynamicCache()
+        assert past_kv_length(dc) == 0  # empty cache
+        # Populate with a fake layer: key and value of shape [B, H, S, D_head]
+        dc.update(torch.randn(1, 4, 15, 32), torch.randn(1, 4, 15, 32), 0)
+        assert past_kv_length(dc) == 15
+
+    def test_past_kv_length_with_get_seq_length_object(self):
+        """past_kv_length should use get_seq_length() when available."""
+        class FakeCache:
+            def __bool__(self):
+                return True
+            def get_seq_length(self):
+                return 99
+        assert past_kv_length(FakeCache()) == 99
+
 
 # ===================================================================
 # Tests: LatentRealigner
@@ -555,6 +576,48 @@ class TestLatentPipelineWithMocks:
 
         # Should still produce a valid result
         assert isinstance(result, PipelineResult)
+        assert result.text == "Answer_0"
+
+    def test_keep_only_latent_truncates_to_actual_steps(self):
+        """keep_only_latent should keep only latent steps, not prompt tokens."""
+        model = MagicMock(spec=LatentModel)
+
+        def fake_prepare(batch_messages, add_generation_prompt=True):
+            bs = len(batch_messages)
+            return [str(m) for m in batch_messages], torch.ones(bs, 8, dtype=torch.long), torch.ones(bs, 8, dtype=torch.long)
+
+        model.prepare_chat_batch.side_effect = fake_prepare
+
+        actual_steps_returned = 7
+        # generate_latent_batch returns a cache of size prompt(8) + latent(7) = 15
+        def fake_latent(input_ids, attention_mask=None, latent_steps=20,
+                        past_key_values=None, convergence_threshold=None):
+            return _make_fake_kv_cache(batch_size=1, seq_len=15), actual_steps_returned
+
+        model.generate_latent_batch.side_effect = fake_latent
+
+        call_counter = [0]
+        def fake_text(input_ids, attention_mask, max_new_tokens=256,
+                      temperature=0.7, top_p=0.95, past_key_values=None):
+            # Check that the KV-cache passed to final agent has only 7 entries (latent steps only)
+            if past_key_values is not None:
+                kv_len = past_kv_length(past_key_values)
+                assert kv_len == actual_steps_returned, \
+                    f"Expected KV-cache length {actual_steps_returned}, got {kv_len}"
+            text = f"Answer_{call_counter[0]}"
+            call_counter[0] += 1
+            return [text], None
+
+        model.generate_text_batch.side_effect = fake_text
+
+        agents = [
+            Agent(name="T", role="t",
+                  prompt_fn=lambda q, c: [{"role": "user", "content": q}]),
+            Agent(name="S", role="s", is_final=True,
+                  prompt_fn=lambda q, c: [{"role": "user", "content": q}]),
+        ]
+        pipeline = LatentPipeline(model, agents, keep_only_latent=True)
+        result = pipeline.run("test")
         assert result.text == "Answer_0"
 
     def test_context_passed_to_prompt_fn(self):

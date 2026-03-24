@@ -227,8 +227,6 @@ class LatentPipeline:
                 )
                 last_latent_steps = steps
 
-                prev_len = past_kv_length(past_kv)
-
                 past_kv, actual_steps = self.model.generate_latent_batch(
                     input_ids,
                     attention_mask=attention_mask,
@@ -238,9 +236,7 @@ class LatentPipeline:
                 )
 
                 if self.keep_only_latent:
-                    new_len = past_kv_length(past_kv)
-                    tokens_added = new_len - prev_len
-                    past_kv = truncate_kv_cache(past_kv, tokens_added)
+                    past_kv = truncate_kv_cache(past_kv, actual_steps)
 
                 for idx in range(batch_size):
                     agent_traces[idx].append({
