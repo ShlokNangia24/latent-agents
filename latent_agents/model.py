@@ -46,6 +46,34 @@ def past_kv_length(past_key_values) -> int:
     return k.shape[-2]
 
 
+def _ensure_cache_format(past_key_values):
+    """Convert a legacy tuple KV cache to DynamicCache if transformers ≥5.x requires it.
+
+    transformers 5.x deprecated plain tuple ``past_key_values`` in both
+    ``model.forward()`` and ``model.generate()``.  When TurboQuant's
+    ``decompress_kv`` returns a plain tuple (its internal format), we need to
+    wrap it back into a ``DynamicCache`` before passing to the model.
+    """
+    if past_key_values is None or not isinstance(past_key_values, tuple):
+        return past_key_values  # already a Cache object or None
+
+    try:
+        from transformers import DynamicCache
+        from transformers.cache_utils import DynamicLayer  # type: ignore[import]
+
+        dc = DynamicCache()
+        for k, v in past_key_values:
+            layer = DynamicLayer()
+            layer.lazy_initialization(k, v)
+            layer.keys = k
+            layer.values = v
+            dc.layers.append(layer)
+        return dc
+    except (ImportError, AttributeError):
+        # Older transformers — plain tuple is the correct format
+        return past_key_values
+
+
 # ---------------------------------------------------------------------------
 # LatentModel
 # ---------------------------------------------------------------------------
@@ -167,6 +195,10 @@ class LatentModel:
         if input_ids.dim() != 2:
             raise ValueError("input_ids must be 2D [batch, seq_len]")
 
+        # transformers 5.x requires a Cache object, not a plain tuple.
+        # TurboQuant.decompress_kv() returns a plain tuple; convert here.
+        past_key_values = _ensure_cache_format(past_key_values)
+
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids, device=self.device)
 
@@ -186,7 +218,9 @@ class LatentModel:
                 )
                 attention_mask = torch.cat([past_mask, attention_mask], dim=-1)
 
-        outputs = self.model.generate(
+        # `cache_position` was added in transformers ~4.40 and its interface
+        # changed in 5.x.  Pass it only when the model accepts it.
+        generate_kwargs: dict = dict(
             input_ids=input_ids,
             attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
@@ -197,8 +231,20 @@ class LatentModel:
             return_dict_in_generate=True,
             output_scores=False,
             past_key_values=past_key_values,
-            cache_position=cache_position,
         )
+        if cache_position is not None:
+            generate_kwargs["cache_position"] = cache_position
+
+        try:
+            outputs = self.model.generate(**generate_kwargs)
+        except (TypeError, ValueError) as exc:
+            # Some models / transformers versions reject cache_position in generate().
+            # (transformers ≥5.0 raises ValueError; some older models raise TypeError.)
+            if "cache_position" in str(exc):
+                generate_kwargs.pop("cache_position", None)
+                outputs = self.model.generate(**generate_kwargs)
+            else:
+                raise
 
         sequences = outputs.sequences
         generations: List[str] = []
@@ -231,6 +277,9 @@ class LatentModel:
         """
         if input_ids.dim() != 2:
             raise ValueError("input_ids must be 2D [batch, seq_len]")
+
+        # transformers 5.x requires a Cache object, not a plain tuple.
+        past_key_values = _ensure_cache_format(past_key_values)
 
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids, device=self.device)

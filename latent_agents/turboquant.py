@@ -121,6 +121,37 @@ class CompressedKV:
 
 
 # ---------------------------------------------------------------------------
+# Cache conversion helpers
+# ---------------------------------------------------------------------------
+
+def _to_cache(legacy_tuple: tuple):
+    """Convert a legacy ``((k, v), ...)`` tuple to a ``DynamicCache`` if
+    transformers ≥5.x is present; otherwise return the plain tuple.
+
+    transformers 5.x deprecated passing plain tuples to ``model.generate()``
+    and ``model.forward()`` as ``past_key_values``.  This helper creates a
+    ``DynamicCache`` object whose ``layers`` list is populated with
+    ``DynamicLayer`` instances, each holding pre-filled key/value tensors.
+    """
+    try:
+        from transformers import DynamicCache
+        from transformers.cache_utils import DynamicLayer  # type: ignore[import]
+
+        dc = DynamicCache()
+        for k, v in legacy_tuple:
+            layer = DynamicLayer()
+            layer.lazy_initialization(k, v)
+            # Overwrite the empty tensors with the pre-filled ones
+            layer.keys = k
+            layer.values = v
+            dc.layers.append(layer)
+        return dc
+    except (ImportError, AttributeError):
+        # Older transformers — plain tuple is the correct format
+        return legacy_tuple
+
+
+# ---------------------------------------------------------------------------
 # Core class
 # ---------------------------------------------------------------------------
 
@@ -345,7 +376,7 @@ class TurboQuant:
     def decompress_kv(
         self,
         compressed: Optional[CompressedKV],
-    ) -> Optional[tuple]:
+    ):
         """Reconstruct a KV cache from its ``CompressedKV`` representation.
 
         Parameters
@@ -354,9 +385,12 @@ class TurboQuant:
 
         Returns
         -------
-        tuple or None
-            Legacy tuple KV cache ``((k0, v0), (k1, v1), ...)`` in
-            ``compressed.original_dtype``, or ``None`` if input is ``None``.
+        DynamicCache or tuple or None
+            Returns a ``transformers.DynamicCache`` when available (transformers
+            ≥4.36), so the result is immediately usable by both the legacy tuple
+            path and the modern Cache-object path.  Falls back to a plain tuple
+            if ``DynamicCache`` is not importable.  Returns ``None`` if input is
+            ``None``.
         """
         if compressed is None:
             return None
