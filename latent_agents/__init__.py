@@ -22,6 +22,7 @@ from .agent import Agent
 from .model import LatentModel
 from .pipeline import LatentPipeline, PipelineResult
 from .realigner import LatentRealigner
+from .turboquant import TurboQuant, TurboQuantConfig, CompressedKV
 from .utils import set_seed, auto_device
 
 __version__ = "0.1.0"
@@ -32,6 +33,9 @@ __all__ = [
     "LatentPipeline",
     "PipelineResult",
     "LatentRealigner",
+    "TurboQuant",
+    "TurboQuantConfig",
+    "CompressedKV",
     "set_seed",
     "auto_device",
 ]

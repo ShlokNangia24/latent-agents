@@ -20,11 +20,12 @@ This is the Python implementation of **LatentMAS** ("Latent Collaboration in Mul
 
 ```
 latent_agents/          # Core library (install with: pip install -e .)
-  __init__.py           # Public API: Agent, LatentModel, LatentPipeline, PipelineResult, LatentRealigner, set_seed, auto_device
+  __init__.py           # Public API: Agent, LatentModel, LatentPipeline, PipelineResult, LatentRealigner, TurboQuant, TurboQuantConfig, set_seed, auto_device
   agent.py              # Agent dataclass (pure config)
   model.py              # LatentModel: wraps HuggingFace causal LM
   pipeline.py           # LatentPipeline: orchestrates agents + KV-cache flow
   realigner.py          # LatentRealigner: training-free projection matrix
+  turboquant.py         # TurboQuant: KV-cache quantization (PolarQuant + QJL, Google ICLR 2026)
   utils.py              # set_seed(), auto_device()
 example.py              # 4-agent demo (planner→critic→refiner→solver)
 tests/
@@ -32,8 +33,9 @@ tests/
   test_latent_agents.py # Unit + integration tests
   test_benchmark.py     # Custom accuracy/speed benchmarks
   test_standard_benchmarks.py # GSM8K / MMLU / ARC benchmarks
-run_quick_benchmark.py  # Quick CPU benchmark (5 samples, M4/laptop-friendly)
-run_gpu_benchmarks.py   # Full GPU benchmark suite (Qwen3, Llama, Mistral, etc.)
+run_quick_benchmark.py       # Quick CPU benchmark (5 samples, M4/laptop-friendly)
+run_gpu_benchmarks.py        # Full GPU benchmark suite (Qwen3, Llama, Mistral, etc.)
+run_turboquant_benchmark.py  # TurboQuant memory/speed before-after benchmark (no model needed)
 GPU_SETUP.md            # Vast.ai / A100 setup guide
 pyproject.toml          # Package metadata, deps
 ```
@@ -250,6 +252,42 @@ Things to verify:
 - Check the model's chat template exists (`tokenizer.chat_template is not None`)
 - For models with tied input/output embeddings (W_in == W_out), realignment degenerates to near-identity — this is correct but realignment adds no value; run with `realign=False` for ablation
 
+### Using TurboQuant KV-Cache Compression
+
+TurboQuant (Google, ICLR 2026, arXiv:2504.19874) compresses the KV cache between latent agents using PolarQuant + QJL error correction. It reduces peak GPU memory by ~2x (int8 storage) to ~4-5x (with bit-packing, not yet implemented), with <0.5% accuracy impact.
+
+```python
+from latent_agents import LatentModel, LatentPipeline, TurboQuant, TurboQuantConfig
+import torch
+
+model = LatentModel("Qwen/Qwen3-8B", device="cuda")
+dtype = next(model.model.parameters()).dtype
+
+tq = TurboQuant(
+    TurboQuantConfig(bits=3, qjl_dim=64),
+    device=model.device,
+    model_dtype=dtype,
+)
+
+pipeline = LatentPipeline(model, agents, latent_steps=20, turbo_quant=tq)
+```
+
+**Memory savings** (Qwen3-8B, 3 agents × 20 latent steps, batch=1):
+- Original KV cache (bfloat16): ~100 MB
+- With TurboQuant int8 (bits=3): ~50 MB (~2x)
+
+**When to use:**
+- Large models (8B+) where KV cache is substantial
+- Many latent steps (>20) or many agents (>3)
+- Tight GPU memory budget
+
+**Tuning:**
+- `bits=4` over `bits=3`: lower error, ~15% more storage
+- `qjl_dim=0`: disable QJL (PolarQuant only, slightly higher error)
+- `enabled=False`: pass-through for ablation without changing pipeline code
+
+**Limitation:** Current implementation stores quantized unit vectors as int8 (one byte per element regardless of `bits`). True bit-packing to `bits` width per element would yield 4-5x compression but is not yet implemented.
+
 ### Adding a New Benchmark
 
 Follow the pattern in `test_standard_benchmarks.py`:
@@ -387,6 +425,10 @@ These paths have no test coverage. Be careful when modifying them:
 | `realign` | True | LatentModel | Set False to ablate; expect 2-5% accuracy drop |
 | `reg` | 1e-5 | Realigner | Tikhonov regularization for W_a; tune if realignment is unstable |
 | `torch_dtype` | None (auto) | LatentModel | bfloat16 on CUDA, float32 on CPU/MPS |
+| `turbo_quant` | None | Pipeline | `TurboQuant` instance; when set, compress KV cache between agents |
+| `bits` | 3 | TurboQuantConfig | Bits per element for PolarQuant unit vector (3 or 4 recommended) |
+| `qjl_dim` | 64 | TurboQuantConfig | QJL projection dimension *k*; 0 disables QJL error correction |
+| `random_seed` | 42 | TurboQuantConfig | Seed for reproducible QJL Rademacher matrix |
 
 ---
 

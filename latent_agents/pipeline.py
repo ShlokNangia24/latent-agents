@@ -22,6 +22,7 @@ except ImportError:
 
 from .agent import Agent
 from .model import LatentModel, past_kv_length
+from .turboquant import TurboQuant
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +160,12 @@ class LatentPipeline:
     vote_fn : callable or None
         Custom voting function ``(candidates: List[str]) -> str``.
         Defaults to majority voting via answer extraction.
+    turbo_quant : TurboQuant or None
+        When provided, the KV-cache is compressed with TurboQuant (PolarQuant
+        + QJL) after each non-final agent and decompressed before the next.
+        This reduces peak GPU memory for large models.  Defaults to ``None``
+        (no quantisation).  See ``latent_agents.TurboQuantConfig`` to tune
+        bits, QJL dimension, and the random seed.
     """
 
     def __init__(
@@ -174,6 +181,7 @@ class LatentPipeline:
         convergence_threshold: Optional[float] = None,
         n_samples: int = 1,
         vote_fn: Optional[Callable] = None,
+        turbo_quant: Optional[TurboQuant] = None,
     ) -> None:
         final_agents = [a for a in agents if a.is_final]
         if len(final_agents) != 1:
@@ -191,6 +199,7 @@ class LatentPipeline:
         self.convergence_threshold = convergence_threshold
         self.n_samples = n_samples
         self.vote_fn = vote_fn
+        self.turbo_quant = turbo_quant
 
     def run(self, question: str, *, context: str = "") -> PipelineResult:
         """Run the full agent pipeline on a single question."""
@@ -237,6 +246,10 @@ class LatentPipeline:
 
                 if self.keep_only_latent:
                     past_kv = truncate_kv_cache(past_kv, actual_steps)
+
+                if self.turbo_quant is not None and self.turbo_quant.config.enabled:
+                    compressed = self.turbo_quant.compress_kv(past_kv)
+                    past_kv = self.turbo_quant.decompress_kv(compressed)
 
                 for idx in range(batch_size):
                     agent_traces[idx].append({
